@@ -55,7 +55,9 @@ import {
   evaluateRetrieval,
   createMemoryIndex,
   thresholdSweep,
+  stagedThresholdSweep,
   calibrateThreshold,
+  ceilingGranularity,
   evaluateDeclines,
   stripChunks,
   stripDecisionContext,
@@ -168,24 +170,53 @@ const main = async () => {
 
   // Decline evaluation: similarity only vs similarity + grounding check, at the
   // configured threshold and (with --calibrate) at the calibrated one.
+  const judge = GROUNDING ? (question, chunks) => checkGrounding(question, chunks) : null;
+  if (GROUNDING) console.log(`Grounding check with ${config.llm.provider} ${config.llm.chatModel} ...`);
+
   let calibration;
   if (CALIBRATION_FILE) {
     const calibrationSet = loadSet(CALIBRATION_FILE);
     console.log(`\nCalibrating the threshold on ${CALIBRATION_FILE} (${calibrationSet.queries.length} questions) ...`);
     const calibrationRun = await runRetrieval(calibrationSet, threshold);
-    const sweep = thresholdSweep(calibrationRun.perQuery, SWEEP);
+    // The similarity-only sweep is kept for comparison, not for the decision:
+    // it measures stage one of a two-stage pipeline. With --grounding the
+    // ceiling is applied to stagedSweep instead, which is the decision the
+    // chatbot actually makes. The gap between the two chosen thresholds is
+    // the defect, so the run reports it on itself.
+    const similaritySweep = thresholdSweep(calibrationRun.perQuery, SWEEP);
+    const stagedSweep = judge
+      ? await stagedThresholdSweep(calibrationRun.perQuery, SWEEP, { judge })
+      : null;
+    const sweep = stagedSweep ?? similaritySweep;
+    const granularity = ceilingGranularity(calibrationRun.perQuery);
     calibration = {
       dataFile: CALIBRATION_FILE,
       rule: `highest threshold in ${SWEEP[0]}-${SWEEP.at(-1)} with false-decline rate <= ${MAX_CALIBRATION_FALSE_DECLINE} on the calibration set`,
+      calibratedOn: stagedSweep ? 'similarity+grounding (as shipped)' : 'similarity-only (stage one only)',
       threshold: calibrateThreshold(sweep, MAX_CALIBRATION_FALSE_DECLINE),
+      similarityOnlyThreshold: calibrateThreshold(similaritySweep, MAX_CALIBRATION_FALSE_DECLINE),
+      granularity,
       sweep,
+      ...(stagedSweep && { similaritySweep }),
       perQuery: calibrationRun.perQuery,
     };
+    console.log(`Calibrated on: ${calibration.calibratedOn}`);
     console.log(`Calibrated threshold: ${calibration.threshold ?? 'none (no threshold met the rule)'}`);
+    if (granularity) {
+      console.log(
+        `Ceiling granularity: ${granularity.answerable} answerable questions, so one question = ` +
+          `${(granularity.perQuestion * 100).toFixed(1)}% and a ${(MAX_CALIBRATION_FALSE_DECLINE * 100).toFixed(0)}% ` +
+          `ceiling allows at most ${Math.floor(MAX_CALIBRATION_FALSE_DECLINE * granularity.answerable)} declined.`
+      );
+    }
+    if (stagedSweep && calibration.similarityOnlyThreshold !== calibration.threshold) {
+      console.log(
+        `NOTE: calibrating on similarity alone would have chosen ${calibration.similarityOnlyThreshold} instead ` +
+          `of ${calibration.threshold} - that gap is the two-stage calibration defect.`
+      );
+    }
   }
 
-  const judge = GROUNDING ? (question, chunks) => checkGrounding(question, chunks) : null;
-  if (GROUNDING) console.log(`Grounding check with ${config.llm.provider} ${config.llm.chatModel} ...`);
   const thresholds = [...new Set([threshold, calibration?.threshold].filter((t) => typeof t === 'number'))];
   const declines = {};
   const sets = { test: result.perQuery, ...(calibration && { calibration: calibration.perQuery }) };

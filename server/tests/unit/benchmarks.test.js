@@ -8,6 +8,8 @@ import {
   evaluateRetrieval,
   createMemoryIndex,
   thresholdSweep,
+  stagedThresholdSweep,
+  ceilingGranularity,
   calibrateThreshold,
   evaluateDeclines,
   stripChunks,
@@ -132,6 +134,48 @@ describe('decline evaluation', () => {
     expect(calibrateThreshold(sweep, 0.05)).toBe(0.5);
     expect(calibrateThreshold(sweep, 0.4)).toBe(0.55);
     expect(calibrateThreshold(thresholdSweep(perQuery, [0.9]), 0.05)).toBeNull();
+  });
+
+  it('calibrates on the two-stage decision, not on similarity alone', async () => {
+    // a1's best chunk clears every threshold in the sweep, so a similarity-only
+    // sweep never sees that the judge rejects it. The shipped pipeline does.
+    const judge = async (question) => ({ grounded: question !== 'a1' });
+    const thresholds = [0.45, 0.5];
+    const similarity = thresholdSweep(perQuery, thresholds);
+    const staged = await stagedThresholdSweep(perQuery, thresholds, { judge });
+
+    expect(similarity[0].falseDeclineRate).toBe(0);
+    expect(staged[0].falseDeclineRate).toBe(0.3333);
+
+    // The defect: stage one admits 0.5, the real pipeline admits nothing.
+    expect(calibrateThreshold(similarity, 0.05)).toBe(0.5);
+    expect(calibrateThreshold(staged, 0.05)).toBeNull();
+  });
+
+  it('shares one judge cache across the sweep, so cost scales with chunk sets', async () => {
+    let calls = 0;
+    const judge = async () => {
+      calls++;
+      return { grounded: true };
+    };
+    const cache = new Map();
+    const thresholds = Array.from({ length: 21 }, (_, i) => Number((0.3 + i * 0.02).toFixed(2)));
+    await stagedThresholdSweep(perQuery, thresholds, { judge, cache });
+
+    // Each question has at most one distinct above-threshold chunk set per
+    // retrieved chunk, so the sweep costs far less than questions x thresholds.
+    const chunkTotal = perQuery.reduce((sum, q) => sum + q.chunks.length, 0);
+    expect(calls).toBeLessThanOrEqual(chunkTotal);
+    expect(calls).toBeLessThan(perQuery.length * thresholds.length);
+
+    const before = calls;
+    await stagedThresholdSweep(perQuery, thresholds, { judge, cache });
+    expect(calls).toBe(before); // fully cached on a second pass
+  });
+
+  it('reports how coarse the false-decline ceiling is on a given set', () => {
+    expect(ceilingGranularity(perQuery)).toEqual({ answerable: 3, perQuestion: 0.3333 });
+    expect(ceilingGranularity([{ expected: null }])).toBeNull();
   });
 
   it('applies the threshold, then the grounding judge, like the chatbot', async () => {

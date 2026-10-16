@@ -190,6 +190,40 @@ export const evaluateDeclines = async (perQuery, { threshold, judge, cache = new
   };
 };
 
+// Decline rates for the full two-stage decision the chatbot actually ships
+// (the similarity threshold, then the grounding judge on the chunks that
+// passed it), for each threshold. Calibrating on this instead of on
+// thresholdSweep is what keeps the false-decline ceiling honest: the
+// similarity-only sweep measures one stage of a two-stage pipeline, so a
+// threshold can sit inside the ceiling there and over-refuse in production.
+//
+// Cost: the judge only ever sees the chunks above the threshold, and that set
+// shrinks monotonically as the threshold rises, so each question has at most
+// topK + 1 distinct judge inputs across the whole sweep. Sharing one cache
+// therefore bounds the sweep at roughly questions x topK judge calls rather
+// than questions x thresholds.
+export const stagedThresholdSweep = async (perQuery, thresholds, { judge, cache = new Map() }) => {
+  const rows = [];
+  for (const threshold of thresholds) {
+    const run = await evaluateDeclines(perQuery, { threshold, judge, cache });
+    rows.push({
+      threshold,
+      falseDeclineRate: run.falseDeclineRate,
+      correctDeclineRate: run.correctDeclineRate,
+    });
+  }
+  return rows;
+};
+
+// The coarsest false-decline rate the ceiling can distinguish on a set this
+// size: one answerable question. With 21 answerable questions a 5% ceiling
+// means "at most one question may be declined", so the chosen threshold turns
+// on a single datapoint — worth printing next to the threshold it picked.
+export const ceilingGranularity = (perQuery) => {
+  const answerable = perQuery.filter((q) => q.expected).length;
+  return answerable ? { answerable, perQuestion: Number((1 / answerable).toFixed(4)) } : null;
+};
+
 // Drops the chunk text from perQuery before a result is saved.
 export const stripChunks = (perQuery) => perQuery.map(({ chunks, ...rest }) => rest);
 
