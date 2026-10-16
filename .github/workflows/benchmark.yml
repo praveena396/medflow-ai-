@@ -1,0 +1,214 @@
+name: API benchmark
+
+# Manual only: Actions tab -> "API benchmark" -> Run workflow.
+# Two jobs on GitHub-hosted runners:
+#   api-load:  benchmarks/api-load.js (autocannon) against the API, with
+#              MongoDB and Redis as service containers. The load generator and
+#              the server share one runner, so treat the numbers as a
+#              description of that environment, not of production.
+#   retrieval-and-pipeline: installs Ollama, pulls nomic-embed-text and
+#              llama3.2, and runs benchmarks/retrieval-eval.js twice
+#              (MongoDB-equivalent ranking with the decline evaluation:
+#              grounding check plus a threshold calibrated on a separate
+#              question set; then retrieval only, through a ChromaDB service
+#              container) and
+#              benchmarks/document-pipeline.js (CPU only, so embedding is
+#              slower than on a GPU).
+# Each job prints its JSON results to the log and uploads them as an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      connections:
+        description: Concurrent connections
+        required: true
+        default: '50'
+      duration:
+        description: Seconds per route
+        required: true
+        default: '20'
+
+permissions:
+  contents: read
+
+jobs:
+  api-load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    defaults:
+      run:
+        working-directory: server
+
+    env:
+      NODE_ENV: production
+      PORT: '5000'
+      MONGO_URI: mongodb://localhost:27017/medflow-bench
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: '6379'
+      EMAIL_DRIVER: mock
+      SMS_DRIVER: mock
+      LOG_LEVEL: error
+      # Lift the per-IP limits: every benchmark request comes from one IP.
+      RATE_LIMIT_MAX: '100000000'
+      AUTH_RATE_LIMIT_MAX: '1000'
+      MONGOMS_DISABLE_POSTINSTALL: '1'
+      BENCH_URL: http://localhost:5000
+      BENCH_CONNECTIONS: ${{ inputs.connections }}
+      BENCH_DURATION: ${{ inputs.duration }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        # --include=dev: NODE_ENV=production (set above) would otherwise make
+        # npm skip devDependencies, and autocannon is one.
+        run: npm ci --include=dev
+
+      - name: Generate throwaway JWT secrets
+        run: |
+          jwt_secret=$(openssl rand -hex 32)
+          jwt_refresh_secret=$(openssl rand -hex 32)
+          # Hide them in the logs, even though they only live for this run.
+          echo "::add-mask::$jwt_secret"
+          echo "::add-mask::$jwt_refresh_secret"
+          echo "JWT_SECRET=$jwt_secret" >> "$GITHUB_ENV"
+          echo "JWT_REFRESH_SECRET=$jwt_refresh_secret" >> "$GITHUB_ENV"
+
+      - name: Seed starter accounts (gives /api/appointments/doctors real rows)
+        run: npm run seed
+
+      - name: Start the API
+        run: |
+          nohup npm start > server.out 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:5000/api > /dev/null; then echo "API is up"; exit 0; fi
+            sleep 1
+          done
+          echo "API did not start"; cat server.out; exit 1
+
+      - name: Run the benchmark
+        run: npm run bench:api
+
+      - name: Print results
+        if: always()
+        run: for f in benchmarks/results/*.json; do echo "== $f"; cat "$f"; done
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-benchmark-${{ github.run_id }}
+          path: |
+            server/benchmarks/results/
+            server/server.out
+            server/error.log
+          if-no-files-found: warn
+
+  retrieval-and-pipeline:
+    runs-on: ubuntu-latest
+    # The grounding check runs llama3.2 on the runner's CPU.
+    timeout-minutes: 60
+
+    services:
+      # For the second retrieval run (VECTOR_STORE=chroma).
+      chroma:
+        image: chromadb/chroma:1.5.9
+        ports:
+          - 8000:8000
+
+    defaults:
+      run:
+        working-directory: server
+
+    env:
+      LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://127.0.0.1:11434
+      LLM_EMBEDDING_MODEL: nomic-embed-text
+      LLM_CHAT_MODEL: llama3.2
+      LLM_TIMEOUT_MS: '300000'
+      LOG_LEVEL: error
+      MONGOMS_DISABLE_POSTINSTALL: '1'
+      CHROMA_URL: http://localhost:8000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --include=dev
+
+      - name: Install Ollama and pull the embedding and chat models
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          # The installer starts a systemd service on most runners; start one
+          # by hand if it did not.
+          if ! curl -fsS http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
+            nohup ollama serve > ollama.out 2>&1 &
+          fi
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; then echo "Ollama is up"; break; fi
+            sleep 1
+          done
+          ollama pull nomic-embed-text
+          ollama pull llama3.2
+          ollama list
+
+      - name: Retrieval quality and declines, MongoDB store (hit@4, hit@1, MRR, decline rates)
+        run: npm run bench:retrieval -- --store=mongo --grounding --calibrate=benchmarks/data/decline-calibration.json
+
+      - name: Wait for ChromaDB
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/api/v2/heartbeat > /dev/null; then echo "Chroma is up"; exit 0; fi
+            sleep 1
+          done
+          echo "Chroma did not start"; exit 1
+
+      - name: Retrieval quality, ChromaDB store (hit@4, hit@1, MRR)
+        run: npm run bench:retrieval -- --store=chroma
+
+      - name: Document pipeline timing (20-page PDF, OCR of one image page)
+        run: npm run bench:pipeline
+
+      - name: Print results
+        if: always()
+        run: for f in benchmarks/results/*.json; do echo "== $f"; cat "$f"; done
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-pipeline-${{ github.run_id }}
+          path: server/benchmarks/results/
+          if-no-files-found: warn

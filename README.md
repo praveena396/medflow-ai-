@@ -1,0 +1,597 @@
+<div align="center">
+
+<br/>
+
+```
+███╗   ███╗███████╗██████╗ ███████╗██╗      ██████╗ ██╗    ██╗     █████╗ ██╗
+████╗ ████║██╔════╝██╔══██╗██╔════╝██║     ██╔═══██╗██║    ██║    ██╔══██╗██║
+██╔████╔██║█████╗  ██║  ██║█████╗  ██║     ██║   ██║██║ █╗ ██║    ███████║██║
+██║╚██╔╝██║██╔══╝  ██║  ██║██╔══╝  ██║     ██║   ██║██║███╗██║    ██╔══██║██║
+██║ ╚═╝ ██║███████╗██████╔╝██║     ███████╗╚██████╔╝╚███╔███╔╝    ██║  ██║██║
+╚═╝     ╚═╝╚══════╝╚═════╝ ╚═╝     ╚══════╝ ╚═════╝  ╚══╝╚══╝     ╚═╝  ╚═╝╚═╝
+```
+
+**A health chatbot that refuses to answer when the patient's own documents don't support the question**
+
+*Grounded retrieval · Measured refusals · Tested in CI · Plus the clinic workflow around it*
+
+<br/>
+
+[![Server tests](https://github.com/praveena396/medflow-ai-/actions/workflows/server-tests.yml/badge.svg)](https://github.com/praveena396/medflow-ai-/actions/workflows/server-tests.yml)
+[![Client build](https://github.com/praveena396/medflow-ai-/actions/workflows/client.yml/badge.svg)](https://github.com/praveena396/medflow-ai-/actions/workflows/client.yml)
+[![Next.js](https://img.shields.io/badge/Next.js-16-black?style=flat-square&logo=nextdotjs)](https://nextjs.org)
+[![Node.js](https://img.shields.io/badge/Node.js-20+-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
+[![MongoDB](https://img.shields.io/badge/MongoDB-7-47A248?style=flat-square&logo=mongodb&logoColor=white)](https://mongodb.com)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-In%20Development-orange?style=flat-square)]()
+
+<br/>
+
+[Grounded retrieval](#the-core-a-chatbot-that-declines) · [Features](#features) · [Architecture](#architecture) · [Setup](#setup) · [API](#api-reference) · [Benchmarks](#benchmarks) · [Measured results](#measured-results) · [Deploy](#deploy) · [Roadmap](#roadmap)
+
+<br/>
+
+</div>
+
+---
+
+> ### Synthetic data only
+>
+> **Every patient record, document, lab value and eval question in this repository is synthetic — invented for this project. No real patient data is used anywhere: not in the seed script, not in the test fixtures, not in the benchmark question sets.** The sample records in [`server/benchmarks/data/`](server/benchmarks/data) and the accounts created by `npm run seed` are made up, and the app has never been pointed at a real clinical system.
+
+---
+
+## The core: a chatbot that declines
+
+The interesting part of this project is not that an LLM answers questions about a patient's documents. It is that it **stops**.
+
+A similarity score only tells you a chunk of text is *about* something close to the question. It cannot tell you the chunk contains the answer — "what did my knee MRI show?" lands comfortably close to a chest X-ray report, and a similarity-only RAG system will happily write a confident answer from it. In a medical setting that failure mode is the one that matters, so the chat route has two gates in front of the model, and both can refuse before any answer is generated:
+
+1. **Similarity floor.** The patient's 4 most similar chunks are retrieved; any chunk below `RAG_SIMILARITY_THRESHOLD` is dropped. If nothing is left, the API returns `declined: true` with `declineReason: "low-similarity"` and the LLM is never called.
+2. **Grounding check** (`RAG_GROUNDING_CHECK`, on by default). The chat model gets the question and the surviving chunks in a separate, short, temperature-0, JSON-only request and answers one narrow question: do these excerpts actually state the thing being asked for? On `false` the API declines with `declineReason: "not-grounded"`. If the reply can't be parsed or the call fails, it falls back to the similarity-only decision rather than refusing silently.
+
+Only then does the question reach the LLM, with a prompt that restricts it to those chunks, and the reply carries the source file names and scores. Every answer and every refusal is written to the append-only audit log.
+
+Because "it refuses correctly" is a claim, not a feeling, it is measured rather than asserted. [`npm run bench:retrieval`](#the-retrieval-and-refusal-eval) runs a labelled set of synthetic documents and **110 questions — 69 answerable with a known source document and 41 that the documents genuinely do not answer**, most of them deliberate near-misses (a test the records say is pending, a value next to one that is recorded, a different scan of an organ the records do cover). One run reports retrieval hit@1 and hit@4 on the answerable set, the correct-refusal rate on the unanswerable set, and the over-refusal rate on the answerable set — each as a rate *and* the counts behind it. The similarity threshold can be calibrated on a [separate question set](server/benchmarks/data/decline-calibration.json), never on the test set. No expected results are hard-coded.
+
+That eval has now been run once end to end, and [Measured results](#measured-results) reports it: on the answerable set, hit@1 **92.8% (64/69)** and hit@4 **98.6% (68/69)**; at the recommended operating point — similarity threshold `0.45` plus the grounding check — correct refusal **85.4% (35/41)** for an over-refusal cost of **7.2% (5/69)**. The similarity floor on its own refuses almost nothing (4.9%, 2/41), so essentially all of the refusal behaviour comes from the second gate. Those figures are from one run on one machine, with the models and the question set named alongside them; they are a sanity check on this configuration, not a general accuracy claim.
+
+**Tests and CI.** [![Server tests](https://github.com/praveena396/medflow-ai-/actions/workflows/server-tests.yml/badge.svg)](https://github.com/praveena396/medflow-ai-/actions/workflows/server-tests.yml) Vitest unit tests and Supertest API tests cover the decline logic, the grounding-verdict parser, prompt sanitising, the access rules, the rate limits and the audit log's append-only behaviour, and they run on every push and pull request against MongoDB, Redis and ChromaDB service containers. The client is linted and built in a second workflow. See [Test](#5-test).
+
+---
+
+## What else is in it
+
+Around that core, MedFlow AI is a full-stack healthcare workflow app: patients triage their symptoms, book appointments, upload medical reports (including photos of lab results and prescriptions) and ask questions about them; doctors manage their appointments and keep a lightweight health record for each of their patients; admins see summary numbers, the appointment queue, the user list and an audit log.
+
+It runs entirely on free, local services by default (Ollama, MongoDB, Redis). It is not deployed anywhere yet; [Deploy](#deploy) lists the exact steps for free hosted services.
+
+> **Important:** MedFlow AI is a workflow and assistance tool, not a diagnostic system. Everything the AI produces is advisory and must be reviewed by a qualified healthcare professional.
+
+---
+
+## Features
+
+| Feature | What the code does |
+|---|---|
+| **Document-grounded chatbot** | Retrieves the patient's 4 most similar chunks. If none reaches `RAG_SIMILARITY_THRESHOLD` (default `0.45`), or a short grounding check finds that the chunks don't contain the answer (`RAG_GROUNDING_CHECK`, on by default), it replies "There is not enough information in your documents to answer that…" with `declined: true` and a `declineReason` (`low-similarity` or `not-grounded`). Otherwise the LLM answers from those chunks only, and the reply lists the source files. Answers and declines are written to the audit log. |
+| **Document processing** | PDF, plain-text, PNG and JPEG uploads. A BullMQ worker extracts the text (`pdf-parse` for PDFs, [tesseract.js](https://github.com/naptha/tesseract.js) OCR for images, with the English model bundled so nothing is downloaded at run time), splits it into 500-word chunks with a 50-word overlap, embeds each chunk, stores the chunks, and writes a short AI summary. The document list shows how the text was read and the OCR confidence. A PDF with no text layer (a scan) fails with a message asking for the pages as images; see [Roadmap](#roadmap). |
+| **Document downloads** | With S3 storage, the API hands out a pre-signed GET URL that expires after 15 minutes (`DOWNLOAD_URL_EXPIRY_SECONDS`). With local storage, the file is streamed through an authenticated route. Either way the same access rules as the health record apply. |
+| **Audit log** | An append-only collection of AI outputs (chat answers, declines and errors; triage results) and admin and clinical actions (user role or status changes, appointment changes and cancellations by an admin, CSV exports, health-record edits and new visits). The model refuses every update and delete path. Admins read it at `/admin/audit` with filters for action, actor, target and date. |
+| **AI symptom triage** | The LLM classifies free-text symptoms as `low`, `medium`, `high` or `critical` (temperature 0, JSON output; "when in doubt, choose the higher urgency"). If the reply can't be parsed, keyword rules decide. Next steps come from a fixed table per urgency. Results are saved to the patient's triage history and the audit log. |
+| **Appointment scheduling** | Patients pick a doctor and a time in the UI. The API rejects a booking or reschedule that overlaps another `scheduled` appointment for the same doctor (`409`), and the booking screen says the slot is taken. Patients can change only their own appointments, doctors only those assigned to them, admins any. Only the doctor or an admin can mark an appointment completed or no-show. |
+| **Health record (lightweight EHR)** | One record per patient: allergies (with reaction and severity), current medications, notes, visit history and links to the patient's uploaded documents. The patient reads their own record; a doctor reads and edits the records of patients they have an appointment with; an admin can read any. When a doctor marks an appointment completed, a visit is added to the record (once per appointment), with optional visit notes. |
+| **Notifications** | Booking queues a confirmation email straight away and a reminder 24 h before (1 h before for appointments less than a day away). Patients with a phone number (optional at registration) also get the reminder by SMS. Email defaults to Ethereal test inboxes and SMS to a mock driver that only logs. SMTP and Twilio are switched on in `.env`. |
+| **Admin dashboard** | Counts of users by role, appointments by status and triage results by urgency, plus the upcoming-appointment queue, a searchable user list where accounts can be deactivated and reactivated, a CSV export of appointments and the audit log. |
+| **Role-based access** | Patient, doctor and admin roles. The role is read from the verified JWT on the server; public registration always creates a patient. |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    UI["Next.js 16 client<br/>React 19, Tailwind 4<br/>Triage, Appointments, Chat, Documents, Records, Admin"]
+    UI -->|"HTTPS REST, refresh token in an httpOnly cookie"| EDGE
+
+    subgraph api["Express API"]
+        direction TB
+        EDGE["helmet, CORS allowlist, Redis-backed rate limits<br/>per IP and per user on the AI routes<br/>JWT auth and role checks, express-validator, prompt sanitising"]
+        EDGE --> REST["Auth, Appointments, Triage,<br/>Documents, Health records, Admin"]
+        EDGE --> CHAT["Chat route"]
+    end
+
+    CHAT --> RETR
+
+    subgraph grounded["Grounded chat: two gates before the model"]
+        direction TB
+        RETR["Retrieve the patient's 4 most similar chunks"]
+        RETR --> SIM{"Any chunk above<br/>RAG_SIMILARITY_THRESHOLD?"}
+        SIM -->|no| DECL1["Decline: low-similarity<br/>the LLM is never called"]
+        SIM -->|yes| GROUND{"Grounding check:<br/>do these excerpts state the answer?"}
+        GROUND -->|no| DECL2["Decline: not-grounded"]
+        GROUND -->|"yes, or reply unreadable"| ANSWER["Answer from those chunks only,<br/>with source file names and scores"]
+    end
+
+    RETR --> VEC
+    GROUND --> LLM
+    ANSWER --> LLM
+    REST --> LLM
+    LLM["llmClient: one axios wrapper"] --> PROV["Ollama llama3.2 and nomic-embed-text,<br/>or OpenAI"]
+
+    REST --> MONGO
+    DECL1 --> AUDIT
+    DECL2 --> AUDIT
+    ANSWER --> AUDIT
+
+    MONGO[("MongoDB via Mongoose<br/>users, appointments, triage,<br/>chat, documents, health records")]
+    AUDIT[("Append-only audit log:<br/>every AI answer, decline and admin change")]
+    VEC[("Chunk embeddings<br/>MongoDB DocumentChunk by default,<br/>or ChromaDB with VECTOR_STORE=chroma")]
+
+    REST -->|"upload returns immediately"| Q(["BullMQ queues on Redis"])
+    Q --> W1["Document worker<br/>extract or OCR, chunk, embed, summarise"]
+    Q --> W2["Notification worker<br/>Nodemailer email, Twilio or mock SMS"]
+    W1 --> VEC
+    W1 --> LLM
+    W1 --> FILES
+    REST --> FILES
+    FILES[("File storage<br/>local disk, or S3-compatible<br/>with pre-signed download URLs")]
+```
+
+- **LLM client:** one small axios wrapper (`server/src/ai/llmClient.js`) with the same chat and embedding calls for Ollama (`llama3.2`, `nomic-embed-text`) and OpenAI (`LLM_PROVIDER=openai`). No LangChain.
+- **Vector search:** there are two drivers behind one interface, chosen with `VECTOR_STORE`.
+  - **`mongo` (default).** Chunk embeddings are stored in MongoDB (`DocumentChunk`). A query loads that patient's chunks and ranks them by cosine similarity in Node (`server/src/services/vectorStoreService.js`). That's simple and fine at the scale of one patient's documents.
+  - **`chroma`.** Chunks go into one [ChromaDB](https://www.trychroma.com) collection in cosine space, through the official `chromadb` client (`server/src/services/chromaVectorStore.js`). Each chunk carries `patientId` and `documentId` metadata, and every search filters on `patientId`, so one patient never retrieves another's text.
+  - **Same behaviour either way.** The score is the same cosine similarity (Chroma's `1 - distance`), so top-4, the threshold and declining work identically. Deleting a document deletes its vectors.
+  - **Switching stores** doesn't copy existing chunks; upload the documents again after you change it.
+- **Background work:** uploads return straight away with `processingStatus: "pending"`; the client polls `GET /api/documents/:id/status`. The workers run as a separate process (`npm run worker`) or, with `RUN_WORKERS_IN_PROCESS=true`, inside the API.
+
+---
+
+## RAG pipeline
+
+**Ingestion (document worker)**
+
+1. The file is read from storage (local disk or S3-compatible).
+2. Text is extracted: `pdf-parse` for PDFs, read directly for `.txt`, and tesseract.js OCR for PNG and JPEG images.
+3. The text is split into chunks of 500 words with a 50-word overlap (`DOC_CHUNK_SIZE_WORDS`, `DOC_CHUNK_OVERLAP_WORDS`).
+4. Each chunk is embedded (`nomic-embed-text` by default) and saved with the patient id and file name, in MongoDB or ChromaDB (`VECTOR_STORE`).
+5. The LLM writes a short summary for the document list.
+
+**Query (chat)**
+
+1. The question is sanitised (see [Security](#security)) and embedded with the same model.
+2. The patient's chunks are ranked by cosine similarity, and the top 4 are kept. With MongoDB this is computed in Node; with ChromaDB it is a filtered nearest-neighbour query.
+3. Chunks below `RAG_SIMILARITY_THRESHOLD` (default `0.45`) are dropped. If none are left, the API returns the "not enough information in your documents" message with `declined: true` and `declineReason: "low-similarity"`, and the LLM is not called.
+4. Grounding check (`RAG_GROUNDING_CHECK`, on by default; set it to `false` to skip): a similar chunk is not always one that answers ("my knee MRI" lands close to a chest X-ray report). The chat model gets the question and the remaining chunks in a separate, short, JSON-only request (temperature 0) and replies `{"answerable": true}` or `{"answerable": false}`. On `false` the API declines with `declineReason: "not-grounded"`. If the reply can't be read or the call fails, the chatbot falls back to the similarity-only decision and answers. It is one extra LLM call per answered question, and works the same with Ollama and OpenAI and with either vector store.
+5. Otherwise the remaining chunks go to the LLM inside `<documents>` tags and the question inside `<question>` tags, with a system prompt that tells it to answer only from those documents and to treat everything inside the tags as data, not instructions.
+6. The reply includes the source file names and similarity scores.
+
+The right threshold depends on the embedding model; the default is `0.45`. One command measures what it costs and what it buys:
+
+```bash
+cd server && npm run bench:retrieval -- --grounding --calibrate=benchmarks/data/decline-calibration.json
+```
+
+That reports retrieval hit@1 and hit@4 on the answerable questions, the correct-refusal rate on the unanswerable ones and the over-refusal rate on the answerable ones — with and without the grounding check, each with the counts behind it — and suggests a threshold calibrated on a separate question set. See [Benchmarks](#the-retrieval-and-refusal-eval) for what the set contains and how to read the output.
+
+On the one measured run so far, the calibration procedure selected `0.57`, but on the held-out test set `0.57` is the worse operating point: it buys 4.8 points of correct refusal and costs 11.6 points of over-refusal, and it drops three genuinely answerable questions below the similarity floor before the grounding check even runs. The default stays `0.45`, and that is the recommended setting — see [Measured results](#measured-results) and [Known limitations of the eval](#known-limitations-of-the-eval).
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| **Frontend** | Next.js 16 (App Router), React 19, Tailwind CSS 4, TypeScript |
+| **Backend** | Node.js 20+, Express 4 (ES modules) |
+| **AI / LLM** | Ollama `llama3.2` by default; OpenAI via `LLM_PROVIDER=openai`; plain axios client |
+| **Embeddings** | Ollama `nomic-embed-text` by default; OpenAI optional |
+| **OCR** | tesseract.js 6 with the bundled English model (`@tesseract.js-data/eng`) |
+| **Vector search** | Embeddings in MongoDB with cosine similarity computed in Node (default), or ChromaDB 1.5 via the `chromadb` client (`VECTOR_STORE=chroma`) |
+| **Database** | MongoDB 7 + Mongoose 7 |
+| **Auth** | JWT access token (15 min) in the response body; refresh token (7 days) in an httpOnly cookie; bcrypt password hashes |
+| **Validation** | express-validator on every route that takes input |
+| **Queue** | BullMQ + Redis (document processing, notifications) |
+| **File storage** | Local disk, or S3-compatible (AWS S3, Cloudflare R2, MinIO) via `FILE_STORAGE_TYPE=s3`, with pre-signed download URLs |
+| **Notifications** | Nodemailer (Ethereal, SMTP or mock); Twilio or mock for SMS |
+| **Logging** | Winston + Morgan; append-only audit log in MongoDB |
+| **Tests** | Vitest + Supertest, mongodb-memory-server, GitHub Actions (server tests, client lint and build) |
+| **Containers** | Docker Compose: mongo, redis, ollama, server, worker, client |
+| **Deployment config** | `render.yaml` (API and worker); Vercel for the client |
+
+---
+
+## Project structure
+
+```
+medflow-ai-/
+├── client/                    # Next.js frontend (App Router)
+│   └── app/
+│       ├── admin/ (audit/) appointments/ auth/ chat/ dashboard/
+│       ├── documents/ records/ triage/
+│       ├── components/        # Navbar
+│       └── lib/               # API client, session hook, downloads
+├── server/                    # Express backend
+│   ├── src/
+│   │   ├── ai/                # llmClient (Ollama/OpenAI), ragChain (chat + triage), prompt sanitising
+│   │   ├── config/            # config, env validation, Redis connection
+│   │   ├── controllers/       # route handlers
+│   │   ├── middleware/        # auth, roles, rate limits, validation runner
+│   │   ├── models/            # Mongoose schemas (incl. HealthRecord, AuditLog)
+│   │   ├── queues/            # BullMQ queues
+│   │   ├── routes/            # API routes
+│   │   ├── services/          # embeddings, vector stores (MongoDB, ChromaDB), storage, OCR, audit, health records, notifications
+│   │   ├── utils/             # logger, database, text extraction, chunking
+│   │   ├── validators/        # express-validator rules
+│   │   └── workers/           # document and notification workers
+│   ├── scripts/seed.js        # starter accounts
+│   ├── tests/                 # unit/ and api/ (Vitest + Supertest)
+│   └── benchmarks/            # load test, pipeline timing, retrieval eval
+├── shared/types/              # shared TypeScript types
+├── .github/workflows/         # server tests, client build, manual benchmarks
+├── render.yaml                # Render Blueprint (API + worker)
+└── docker-compose.yml
+```
+
+---
+
+## Setup
+
+### Prerequisites (all free; no paid API keys needed)
+
+- Node.js 20 or later
+- MongoDB (local Community Server, Docker, or a free Atlas cluster)
+- Redis (`redis-server`, Docker, or [Memurai](https://www.memurai.com) on Windows)
+- [Ollama](https://ollama.com) with two models: `ollama pull llama3.2` and `ollama pull nomic-embed-text`
+- Optional: [ChromaDB](https://docs.trychroma.com) if you set `VECTOR_STORE=chroma`, e.g. `docker run -p 8000:8000 chromadb/chroma:1.5.9` or `docker compose --profile chroma up -d chroma`; then set `CHROMA_URL=http://localhost:8000`
+
+OpenAI, S3, SMTP and Twilio are optional; each is switched on by a driver flag in `server/.env`. The OCR model ships with the `@tesseract.js-data/eng` package, so it needs no extra setup.
+
+The refresh cookie is `Secure` by default. Chrome and Firefox accept that on `http://localhost`. If you use Safari, or reach the API over plain HTTP under another host name, set `REFRESH_COOKIE_SECURE=false` in `server/.env`. Otherwise the browser drops the cookie and you'll have to log in again every 15 minutes.
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/praveena396/medflow-ai-.git
+cd medflow-ai-
+cd server && npm install
+cd ../client && npm install
+```
+
+### 2. Configure
+
+```bash
+cd server
+cp .env.example .env
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"   # JWT_SECRET
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"   # JWT_REFRESH_SECRET
+```
+
+Every setting is explained in [`server/.env.example`](server/.env.example).
+
+### 3. Seed starter accounts
+
+```bash
+cd server && npm run seed
+```
+
+This creates two doctors, an admin and a test patient (password pattern `<Role>@123`, e.g. `patient@medflow.local` / `Patient@123`). Change them outside local development.
+
+### 4. Run
+
+```bash
+cd server && npm start         # API on http://localhost:5000
+cd server && npm run worker    # background worker (documents + notifications)
+cd client && npm run dev       # frontend on http://localhost:3000
+```
+
+### 5. Test
+
+```bash
+cd server && npm test
+```
+
+The API tests need Redis on `localhost:6379` (for the rate-limiter store). For MongoDB they use:
+
+1. `MONGO_URI` if it is set; the database name must contain "test", because the tests drop it;
+2. otherwise a throwaway in-memory MongoDB from `mongodb-memory-server` (it downloads a `mongod` binary on first run);
+3. otherwise `mongodb://localhost:27017/medflow-test`.
+
+The ChromaDB integration test (`tests/integration/chroma.test.js`) runs only when `CHROMA_URL` points at a Chroma server; otherwise it is skipped:
+
+```bash
+CHROMA_URL=http://localhost:8000 npm test
+```
+
+GitHub Actions runs the same suite on every push and pull request, against MongoDB, Redis and ChromaDB service containers ([workflow](.github/workflows/server-tests.yml)). A second workflow lints and builds the client ([workflow](.github/workflows/client.yml)):
+
+```bash
+cd client && npm run lint && npm run build
+```
+
+### Docker (alternative)
+
+```bash
+docker compose up -d
+# first run only: pull the models into the ollama container
+docker compose exec ollama ollama pull llama3.2
+docker compose exec ollama ollama pull nomic-embed-text
+
+# with the ChromaDB vector store (also set VECTOR_STORE=chroma in server/.env)
+docker compose --profile chroma up -d
+```
+
+---
+
+## API reference
+
+All routes except register, login, refresh, logout, `/api` and `/health` need `Authorization: Bearer <access token>`. Validation errors return `400` with `{ message, errors: [{ field, message }] }`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/auth/register` | Register a patient (`name`, `email`, `password` of 8+ characters, optional `phone` in E.164 format). Staff accounts come from the seed script. Returns `token` and `user`, and sets the refresh cookie. |
+| `POST` | `/api/auth/login` | Log in; returns `token` and `user`, and sets the refresh cookie. `403` for a deactivated account. |
+| `POST` | `/api/auth/refresh` | Reads the refresh cookie, rotates it and returns a new `token` (`401` without the cookie, `403` if it is invalid) |
+| `POST` | `/api/auth/logout` | Clears the refresh cookie |
+| `GET` | `/api/auth/me` | The current user |
+| `GET` | `/api/appointments` | Appointments where the user is the patient or the doctor |
+| `GET` | `/api/appointments/doctors` | Doctors available for booking |
+| `POST` | `/api/appointments` | Book (`doctorId`, future ISO `dateTime`, `reason`, optional `duration` in minutes); `409` if the doctor is busy |
+| `PATCH` | `/api/appointments/:id` | Change `dateTime`, `reason` or `status` (owner, assigned doctor or admin; only the doctor or an admin can set `completed` or `no-show`); `409` on overlap. Setting `completed` adds a visit to the patient's health record, with optional `notes`, and returns `visitAdded`. |
+| `DELETE` | `/api/appointments/:id` | Cancel (owner, assigned doctor or admin) |
+| `POST` | `/api/chat` | Ask the chatbot (`message`, up to 2,000 characters; 20 a minute per user); the response has `text`, `sourceDocuments`, `confidence` and `declined` |
+| `GET` | `/api/chat/history` | The current chat session |
+| `DELETE` | `/api/chat/history` | Clear the chat session |
+| `POST` | `/api/triage` | Assess symptoms (`symptoms`, up to 2,000 characters; 20 a minute per user) |
+| `GET` | `/api/triage/history` | Past assessments |
+| `POST` | `/api/documents` | Upload a PDF, `.txt`, PNG or JPEG (multipart `file`, max 10 MB); processed in the background |
+| `GET` | `/api/documents` | The user's documents |
+| `GET` | `/api/documents/:id/status` | Processing status |
+| `GET` | `/api/documents/:id/download` | `{ mode: "s3", url, expiresIn }` with a pre-signed URL, or `{ mode: "local", url }` pointing at the route below |
+| `GET` | `/api/documents/:id/file` | The file itself (local storage), or a redirect to a pre-signed URL (S3) |
+| `DELETE` | `/api/documents/:id` | Delete a document and its chunks |
+| `GET` | `/api/records/me` | The patient's own health record |
+| `GET` | `/api/records/patients` | Patients whose records the user can open (a doctor's patients, or everyone for an admin) |
+| `GET` | `/api/records/:patientId` | A patient's record (the patient, their doctors, or an admin); includes `canEdit` |
+| `PATCH` | `/api/records/:patientId` | Replace `allergies`, `currentMedications` and/or `notes` *(the patient's doctor)* |
+| `POST` | `/api/records/:patientId/visits` | Add a visit (`reason`, optional `date`, `diagnosis`, `notes`, `appointmentId`, `documentIds`) *(the patient's doctor)* |
+| `GET` | `/api/admin/stats` | Dashboard counts *(admin)* |
+| `GET` | `/api/admin/appointments` | Upcoming appointment queue *(admin)* |
+| `GET` | `/api/admin/users` | User list with search *(admin)* |
+| `PATCH` | `/api/admin/users/:id` | Change a user's `role` or `isActive` (not your own) *(admin)* |
+| `GET` | `/api/admin/export/appointments` | CSV export *(admin)* |
+| `GET` | `/api/admin/audit` | Audit log: `action` (exact, or a prefix ending in `*` such as `ai.*`), `actorId`, `targetType`, `targetId`, `from`, `to`, `page`, `limit` (max 200) *(admin)* |
+| `GET` | `/health` | MongoDB, Redis and LLM status |
+
+---
+
+## Security
+
+What is implemented:
+
+- **JWT auth.** Access tokens last 15 minutes and are returned in the JSON body; the client keeps the access token and the user in `localStorage`. Refresh tokens last 7 days and travel only in an httpOnly, `Secure`, `SameSite=Strict` cookie scoped to `/api/auth`, so page scripts can't read them. Each refresh rotates the cookie, and logout clears it. Passwords are hashed with bcrypt. Deactivated accounts can't log in.
+- **Server-side roles.** The role comes from the verified token, never from the client. Admin routes require `admin`. Appointment changes are limited to the patient who booked, the assigned doctor or an admin. Health records and document downloads are limited to the patient, doctors with an appointment with that patient, and admins; only those doctors can edit. Chat is scoped to the patient. Public registration can only create patients.
+- **Input validation.** express-validator rules on every route that takes input, including a 2,000-character cap on chat messages and symptoms.
+- **Rate limiting.** Counters live in Redis. Per IP: 300 requests per 15 minutes across `/api`, and 20 per 15 minutes on `/api/auth`. Per user (keyed by user id, so one account can't get around it by changing IP): 20 requests a minute on `/api/chat` and `/api/triage`. All are configurable (`RATE_LIMIT_*`, `AUTH_RATE_LIMIT_*`, `AI_RATE_LIMIT_*`).
+- **Prompt-injection hardening.** User text is normalised (NFKC) and stripped of control, zero-width and bidi characters, model special tokens (`<|...|>`, `[INST]`, `<<SYS>>`), fake `system:` / `assistant:` role lines and the tags the prompts use, then length-capped. Document text gets the same treatment before it goes into a prompt. The system prompts stay scoped to their task and say to treat tagged content as data. This lowers the risk; it can't remove it.
+- **Audit log.** AI outputs and admin and clinical changes are written to an append-only collection: the model throws on every update, replace and delete path, and there is no API to change entries.
+- **HTTP hardening.** `helmet`, a CORS allowlist (`CORS_ORIGINS`, with credentials for the cookie), a 1 MB JSON body limit, and uploads limited to PDF, plain text, PNG and JPEG up to 10 MB.
+- **Storage.** With the S3 driver, uploads are written with server-side encryption (`AES256`) and downloads use pre-signed URLs that expire after 15 minutes. With local storage, files are only reachable through the authenticated `/api/documents/:id/file` route, sent with `Cache-Control: private, no-store`.
+- **Prompting.** The chat system prompt restricts answers to the retrieved documents, and the API declines before calling the LLM when nothing relevant is found. This reduces, but cannot rule out, wrong answers.
+
+---
+
+## Benchmarks
+
+The scripts live in [`server/benchmarks/`](server/benchmarks). Run them from `server/`. Results are written as JSON to `server/benchmarks/results/` (git-ignored) together with the machine details. **Any figures quoted for this project should come from these scripts, along with the environment they ran in.** The retrieval and refusal eval has been run and its numbers are recorded below in [Measured results](#measured-results); the load test and the pipeline benchmark have no recorded figures here.
+
+> **How to read the load-test numbers.** The one `bench:api` run this project has done so far was on a **single GitHub-hosted GitHub Actions runner with the load generator, the API, MongoDB and Redis all on that same runner** (the `api-load` job below, autocannon at 50 connections). That means the client competes with the server for the same two cores and nothing crosses a network, so the throughput and p95 from that run describe *that* arrangement. It is a **relative benchmark** — useful for comparing one commit against another on the same setup — and **not a capacity claim** for a real deployment. The same applies to `bench:retrieval` and `bench:pipeline` when they run in CI, on the runner's CPU with no GPU. The retrieval and refusal figures recorded in [Measured results](#measured-results) were *not* measured on a runner: they come from a local machine running Ollama, and the judge latencies in particular describe that machine.
+
+| Command | Measures | Needs |
+|---|---|---|
+| `npm run bench:api` | [autocannon](https://github.com/mcollina/autocannon) against the non-AI routes (`GET /api`, `/api/appointments/doctors`, `/api/appointments`): requests per second and p50/p95/p99 latency at a set concurrency | A running API, MongoDB and Redis |
+| `npm run bench:pipeline` | The document worker's stages on a generated multi-page PDF (text extraction, chunking, embedding every chunk, and the total per page), plus OCR time for a generated image of a lab-report page | Nothing for `-- --no-embed`; Ollama (or OpenAI) for the embedding step |
+| `npm run bench:retrieval` | **Retrieval and refusal quality** on the labelled synthetic set ([`benchmarks/data/retrieval-eval.json`](server/benchmarks/data/retrieval-eval.json)): hit@1 and hit@4 on the answerable questions, the correct-refusal rate on the unanswerable ones, the over-refusal rate on the answerable ones, and mean reciprocal rank — each printed as a percentage *and* the counts behind it. `-- --store=mongo` (the default ranking) or `-- --store=chroma` (through the ChromaDB driver). `-- --grounding` adds the grounding check to the refusal decision, so the two gates can be compared. `-- --calibrate=<file>` picks the highest threshold in 0.30-0.70 that wrongly refuses at most 5% of the answerable questions in a **separate** set ([`benchmarks/data/decline-calibration.json`](server/benchmarks/data/decline-calibration.json)) and then reports it on the test set; the test set is never used to choose a threshold | Ollama with `nomic-embed-text` (or OpenAI), plus `llama3.2` for `--grounding`; a Chroma server for `--store=chroma` |
+
+```bash
+# API load test: raise the per-IP limit, or most requests become 429s
+RATE_LIMIT_MAX=100000000 npm start      # terminal 1
+npm run bench:api                       # terminal 2; BENCH_CONNECTIONS=50 BENCH_DURATION=20 by default
+
+# Document pipeline: BENCH_PAGES=20 BENCH_RUNS=5 BENCH_OCR_RUNS=3 by default
+npm run bench:pipeline
+npm run bench:pipeline -- --no-embed --no-ocr
+
+# Retrieval and refusal eval — the full version is one command.
+# Once: the embedding model, and the chat model for the grounding check.
+ollama pull nomic-embed-text
+ollama pull llama3.2
+
+cd server
+npm run bench:retrieval -- --grounding --calibrate=benchmarks/data/decline-calibration.json
+
+# Shorter variants
+npm run bench:retrieval                      # retrieval + similarity-only refusals, VECTOR_STORE (mongo by default)
+npm run bench:retrieval -- --store=chroma    # same, through the ChromaDB driver; needs CHROMA_URL
+npm run bench:retrieval -- --data=<file>     # a different question set, path relative to server/
+```
+
+### The retrieval and refusal eval
+
+One run of
+
+```bash
+cd server && npm run bench:retrieval -- --grounding --calibrate=benchmarks/data/decline-calibration.json
+```
+
+prints, each labelled and each with its counts:
+
+| Reported | On | Meaning |
+|---|---|---|
+| **hit@1** | the answerable questions | the source document was ranked first |
+| **hit@4** | the answerable questions | the source document was among the 4 chunks the chatbot would use |
+| **mean reciprocal rank** | the answerable questions | average of 1/rank of the source document |
+| **correct refusal rate** (true positives) | the unanswerable questions | the chatbot declined, as it should |
+| **over-refusal rate** (false refusals) | the answerable questions | the chatbot declined although the answer was retrievable |
+
+The last two are reported twice: for the similarity threshold alone, and for the similarity threshold followed by the grounding check, so the second gate's contribution — and its cost in over-refusals — is visible rather than assumed.
+
+The question set is [`benchmarks/data/retrieval-eval.json`](server/benchmarks/data/retrieval-eval.json): 10 synthetic documents and 110 questions, 69 of them answerable with a labelled source document and 41 that the documents genuinely do not answer. The unanswerable block is mostly **near-misses** — a test the records say is pending but whose result is absent (`"What was my ferritin result?"`), a value next to one that is recorded (`"What was my oxygen saturation when I was admitted?"`, where only the discharge figure exists), a different scan of an organ the records do cover (`"What did my thyroid ultrasound show?"`), an allergen not on the allergy list (`"Am I allergic to aspirin?"`). Those are the questions a similarity-only system answers confidently and wrongly. Every question was written from the text of these documents, and `tests/unit/benchmarks.test.js` checks the labels themselves: every non-null `expected` names a real document, no question is duplicated, and no test question also appears in the calibration set.
+
+No expected results are hard-coded anywhere and the thresholds are not tuned on the test set. The documents are synthetic and the set is small, so treat the figures below as a sanity check on this configuration, not a general accuracy claim.
+
+### Measured results
+
+One measured run, on a local machine with [Ollama](https://ollama.com): `nomic-embed-text` for the embeddings, `llama3.2` as the grounding judge, and the in-process memory index, which applies the same cosine ranking as the default `VECTOR_STORE=mongo` driver. The test set is the 110-question set — 69 answerable, 41 unanswerable — over the 10 **synthetic** sample records. All four refusal configurations below come from that single run.
+
+**Retrieval, answerable set (69 questions)**
+
+| Metric | Result |
+|---|---|
+| hit@1 (source document ranked first) | **92.8%** (64/69) |
+| hit@4 (source document among the 4 chunks used) | **98.6%** (68/69) |
+| mean reciprocal rank | **0.9565** |
+
+**Refusal, four configurations from the same run**
+
+| Configuration | Correct refusal (41 unanswerable) | Over-refusal (69 answerable) | Grounding-judge latency, median |
+|---|---|---|---|
+| similarity only, threshold `0.45` | 4.9% (2/41) | 0.0% (0/69) | — |
+| **similarity + grounding, threshold `0.45`** — recommended | **85.4%** (35/41) | **7.2%** (5/69) | 8386 ms |
+| similarity only, threshold `0.57` | 21.9% (9/41) | 4.3% (3/69) | — |
+| similarity + grounding, threshold `0.57` | 90.2% (37/41) | 18.8% (13/69) | 3182 ms |
+
+**Recommended operating point: `RAG_SIMILARITY_THRESHOLD=0.45` with `RAG_GROUNDING_CHECK=true`.** Two things are visible in that table. First, the similarity floor alone is nearly useless as a refusal gate on this set — at `0.45` it catches 2 of 41 unanswerable questions — so the grounding check is what makes the chatbot decline, taking correct refusal from 4.9% to 85.4%. Second, and less comfortably: **the calibration procedure selected `0.57`, but on the held-out test set `0.57` is a worse operating point than `0.45`.** Raising the threshold buys 4.8 points of correct refusal (85.4% → 90.2%) and costs 11.6 points of over-refusal (7.2% → 18.8%) — 8 more answerable questions refused to catch 2 more unanswerable ones. Three of those extra refusals are questions whose source document is retrievable but now falls below the similarity floor, so they are declined before the judge ever runs: *"What was my ejection fraction?"*, *"What did the Holter monitor find?"*, *"Do I need a foot examination?"* Declining a question the patient's own records answer is a real failure, so the default stays at `0.45` and the calibrated value is not adopted.
+
+**Calibration set (36 questions: 15 unanswerable, 21 answerable).** This is the separate set used to choose a threshold, never the test set:
+
+| Configuration | Correct refusal (15 unanswerable) | Over-refusal (21 answerable) |
+|---|---|---|
+| similarity only, threshold `0.45` | 0.0% (0/15) | — |
+| similarity + grounding, threshold `0.45` | 100% (15/15) | 28.6% (6/21) |
+| similarity only, threshold `0.57` | 73.3% (11/15) | 4.8% (1/21) |
+| similarity + grounding, threshold `0.57` | 100% (15/15) | 28.6% (6/21) |
+
+With the grounding check on, `0.45` and `0.57` are indistinguishable on the calibration set — both refuse all 15 unanswerable questions at the same 28.6% over-refusal — which is exactly why the procedure had no reason to prefer the lower threshold, and why it went on to pick the higher one.
+
+### Known limitations of the eval
+
+- **The calibration objective optimizes for correct refusal without weighing over-refusal.** `--calibrate` picks the *highest* threshold in 0.30–0.70 that keeps over-refusal within its cap on the calibration set. On the measured run that selected `0.57`, which is the worse of the two operating points on the held-out test set. The threshold is therefore chosen by hand (`0.45`) rather than taken from the procedure. Fixing this properly means scoring candidate thresholds on a cost that weighs a wrong refusal against a wrong answer — and that weighting is a product decision, not a benchmark detail — so it is recorded here rather than quietly patched.
+- **The calibration set is too small, and too easy, to separate the candidates.** 15 unanswerable questions, and the grounding check clears all of them at both thresholds; there is no signal left for the procedure to act on.
+- **The grounding check costs several seconds per question.** It is one extra LLM call before every answer — a median of 8386 ms at `0.45` and 3182 ms at `0.57` on the measured machine, with local `llama3.2` on CPU. That is a deliberate trade-off: the second gate is the only thing doing real refusal work (4.9% → 85.4%), and the latency falls on answered questions, which is where the project would rather spend it. A smaller or hosted judge model, or caching verdicts, would cut it.
+- **One run, one machine, 110 questions, synthetic records.** Both rates have confidence intervals wider than the differences being discussed, and the judge is a sampling LLM, so a rerun will not reproduce these counts exactly.
+
+The **API benchmark** workflow ([`.github/workflows/benchmark.yml`](.github/workflows/benchmark.yml)) is started by hand from the Actions tab, with a choice of concurrency and duration. It has two jobs:
+
+- `api-load` starts the API against MongoDB and Redis service containers and runs `bench:api`. The load generator, the API, MongoDB and Redis are all on that one runner, which is where the only load-test numbers this project has were measured — see the note at the top of this section.
+- `retrieval-and-pipeline` installs Ollama, pulls `nomic-embed-text` and `llama3.2` and runs `bench:pipeline` and `bench:retrieval` on the runner's CPU. The retrieval benchmark runs twice: once with the MongoDB ranking plus the decline evaluation (`--grounding --calibrate=…`), and once against a ChromaDB service container.
+
+Both print their JSON results in the job log and upload them as an artifact. Everything runs on one shared GitHub-hosted runner per job, so those numbers describe that runner, not a production deployment.
+
+---
+
+## Deploy
+
+The repository is ready to deploy but is not deployed. The plan below uses free tiers: the client on **Vercel**, the API on **Render**, **MongoDB Atlas M0**, **Upstash Redis** and an **OpenAI API key** (Ollama can't run on these hosts). Do the steps in this order, because each one produces a value the next one needs.
+
+**1. MongoDB Atlas (M0, free)**
+
+1. At [cloud.mongodb.com](https://cloud.mongodb.com), create a project and a **M0** cluster.
+2. Under *Database Access*, add a user with a generated password and the *Read and write to any database* role.
+3. Under *Network Access*, allow `0.0.0.0/0`. Render's free services have no fixed outbound IP.
+4. Under *Connect* → *Drivers*, copy the `mongodb+srv://...` string, put the password in, and add the database name: `.../medflow?retryWrites=true&w=majority`. This is `MONGO_URI`.
+
+**2. Upstash Redis (free)**
+
+1. At [console.upstash.com](https://console.upstash.com), create a Redis database in the region closest to your Render region.
+2. Copy the `rediss://default:<password>@<name>.upstash.io:6379` URL. It must start with `rediss://`, because Upstash requires TLS. This is `REDIS_URL`.
+3. BullMQ polls Redis, which uses up the free tier's command quota faster than normal traffic. Keep an eye on it in the Upstash console.
+
+**3. OpenAI**
+
+1. Create an API key at [platform.openai.com/api-keys](https://platform.openai.com/api-keys) and add a small amount of credit. This is `OPENAI_API_KEY`.
+2. `render.yaml` sets `LLM_CHAT_MODEL=gpt-4o-mini` and `LLM_EMBEDDING_MODEL=text-embedding-3-small`. OpenAI embeddings have a different size from `nomic-embed-text`, so documents embedded locally won't match questions embedded in production. Upload them again after you switch.
+
+**4. File storage (S3 or Cloudflare R2)**
+
+Render's disk is wiped on every deploy, so keep uploads in a bucket. `render.yaml` sets `FILE_STORAGE_TYPE=s3`.
+
+- **AWS S3:** create a private bucket, and an IAM user with `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on it. Set `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`, and leave `S3_ENDPOINT` empty.
+- **Cloudflare R2:** this has a free tier. Create a bucket and an R2 API token with *Object Read & Write*. Set `S3_ENDPOINT=https://<account id>.r2.cloudflarestorage.com` and `S3_REGION=auto`, plus the bucket, key id and secret.
+
+Downloads are pre-signed URLs, so the bucket stays private.
+
+**5. Render (API and worker)**
+
+1. At [dashboard.render.com](https://dashboard.render.com), choose *New* → *Blueprint* and pick this repository. Render reads [`render.yaml`](render.yaml): a `medflow-api` web service and a `medflow-worker` background worker, both built from `server/`. They share an environment group, and the JWT secrets are generated for you.
+2. When asked, fill in `MONGO_URI`, `REDIS_URL`, `OPENAI_API_KEY` and the `S3_*` values from steps 1 to 4. Set `CORS_ORIGINS` to a placeholder for now; you'll get the real value in step 6.
+3. Render has no free background workers. To stay free, delete the `medflow-worker` service from `render.yaml` before you create the Blueprint, and set `RUN_WORKERS_IN_PROCESS=true` on `medflow-api`. The API then runs the document and notification workers itself.
+4. The blueprint already sets these for you:
+   - `REFRESH_COOKIE_SAMESITE=none` and `REFRESH_COOKIE_SECURE=true`. The client and API are on different sites, and browsers only send a cross-site cookie that is `SameSite=None; Secure`.
+   - `TRUST_PROXY=1`, so the per-IP rate limits see the client's address and not Render's proxy.
+5. After the first deploy, open `https://<service>.onrender.com/health`. It should report `database`, `redis` and `llm` as `up`. Free web services sleep after 15 minutes without traffic, so the first request after that is slow.
+6. To create the staff accounts, run the seed script once from your own machine against Atlas: `cd server && MONGO_URI='<the Atlas string>' npm run seed`. Render's free instances have no shell. Then change those passwords.
+
+**6. Vercel (client)**
+
+1. At [vercel.com/new](https://vercel.com/new), import the repository and set **Root Directory** to `client`. Vercel detects Next.js, so no `vercel.json` is needed.
+2. Add the environment variable `NEXT_PUBLIC_API_URL=https://<service>.onrender.com`, with no trailing slash, and deploy.
+3. Copy the Vercel URL, for example `https://medflow.vercel.app`. Set it as `CORS_ORIGINS` on the Render service, with no trailing slash and comma-separated if there are several, and redeploy the API.
+
+**7. Check the deployment**
+
+1. Register a patient on the Vercel site and reload the page. Staying logged in after the access token expires shows the refresh cookie works.
+2. Upload a PDF or a photo of a report, and wait until it shows as processed.
+3. Ask the chatbot about it.
+4. Log in as the seeded admin and open *Audit Log*. The chat answer should be there.
+
+Optional: set `EMAIL_DRIVER=smtp` with `SMTP_*`, and `SMS_DRIVER=twilio` with `TWILIO_*`, to send real notifications.
+
+---
+
+## Design notes
+
+- **Decline rather than guess.** In a medical setting, "I don't know" is safer than a fluent wrong answer, so the API declines when retrieval finds nothing relevant, before calling the LLM.
+- **Queues for slow work.** PDF extraction, embedding and email/SMS run in BullMQ workers, so requests don't wait on them and failed jobs can be retried.
+- **One LLM gateway.** Every model call goes through `llmClient`, so switching between Ollama and OpenAI is a single environment variable.
+- **Roles enforced on the server.** The frontend only decides what to show; the API checks the token's role and resource ownership on every request.
+- **Care relationship as the access rule.** A doctor can open a patient's record only if the two share an appointment. That's simple to explain and to check, and it means a doctor can't browse records of patients they've never seen.
+- **An audit log that can only grow.** Entries are written with the outcome of each AI call and admin change, and the model rejects every update and delete. Writing an entry never fails the request it describes.
+
+---
+
+## Roadmap
+
+Built: Vitest + Supertest unit and API tests and a client lint and build, run in CI on every push and pull request; a two-gate grounded chat route with a 110-question retrieval and refusal eval behind it; OCR for images; a lightweight health record; an append-only audit log; httpOnly-cookie refresh tokens; per-user limits on the AI routes; prompt-injection hardening; pre-signed download URLs; a ChromaDB vector store option; deployment configuration.
+
+Not built yet:
+
+- [ ] OCR for scanned PDFs. Images are read with OCR, but a PDF without a text layer is rejected with a request to upload the pages as images, because the PDF would first have to be rasterised.
+- [ ] Deployment and a public demo (the configuration and steps are in [Deploy](#deploy))
+- [ ] Doctor working hours and an availability calendar (today only overlaps are prevented)
+- [ ] Booking and rescheduling through the chatbot
+- [ ] Medication reminders
+- [ ] Hospital operations view (e.g. bed occupancy)
+- [ ] An approximate-nearest-neighbour index in MongoDB (Atlas Vector Search) for the default store. ChromaDB is available today through `VECTOR_STORE=chroma`.
+- [ ] FHIR integration
+- [ ] Voice input for triage (Web Speech API)
+- [ ] Hindi and Telugu support
+- [ ] OpenAPI / Swagger docs
+
+---
+
+## Author
+
+**Praveena Ganesan**, Full Stack Developer
+
+[![GitHub](https://img.shields.io/badge/GitHub-praveena396-181717?style=flat-square&logo=github)](https://github.com/praveena396)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-praveena--ganesan-0A66C2?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/praveena-ganesan-b84541247/)
+
+---
+
+<div align="center">
+
+*Built with care for better healthcare workflows.*
+
+</div>
