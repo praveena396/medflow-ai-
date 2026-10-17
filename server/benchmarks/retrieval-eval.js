@@ -1,5 +1,5 @@
 // Retrieval and refusal quality on a labelled set of synthetic documents and
-// questions (benchmarks/data/retrieval-eval.json). Needs a running embedding
+// questions (benchmarks/data/retrieval-eval-expanded.json). Needs a running embedding
 // model, so run it locally. One command, from server/:
 //
 //   ollama pull nomic-embed-text                 # once
@@ -41,7 +41,9 @@
 //                         reported on the test set; the test set is never used
 //                         to choose it.
 //   --data=<file>         a different test set (default
-//                         benchmarks/data/retrieval-eval.json; paths are
+//                         benchmarks/data/retrieval-eval-expanded.json, whose
+//                         first 110 questions are the original
+//                         retrieval-eval.json; paths are
 //                         relative to server/).
 // Every refusal row reports both the share of unanswerable questions refused
 // and the share of answerable questions wrongly refused, with counts.
@@ -84,7 +86,7 @@ const arg = (name) => {
   return found.includes('=') ? found.slice(found.indexOf('=') + 1) : true;
 };
 const STORE = String(arg('store') || config.vectorStore.driver).toLowerCase();
-const DATA_FILE = arg('data') || 'benchmarks/data/retrieval-eval.json';
+const DATA_FILE = arg('data') || 'benchmarks/data/retrieval-eval-expanded.json';
 const CALIBRATION_FILE = arg('calibrate');
 const GROUNDING = Boolean(arg('grounding'));
 

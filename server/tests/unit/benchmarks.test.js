@@ -305,6 +305,7 @@ describe('retrieval eval question sets', () => {
   const dataDir = path.join(fileURLToPath(new URL('.', import.meta.url)), '../../benchmarks/data');
   const load = (file) => JSON.parse(fs.readFileSync(path.join(dataDir, file), 'utf-8'));
   const testSet = load('retrieval-eval.json');
+  const expandedSet = load('retrieval-eval-expanded.json');
   const calibrationSet = load('decline-calibration.json');
   const normalise = (q) => q.question.trim().toLowerCase();
 
@@ -313,6 +314,38 @@ describe('retrieval eval question sets', () => {
     const unknown = testSet.queries.filter((q) => q.expected !== null && !ids.has(q.expected));
     expect(unknown).toEqual([]);
     expect(testSet.queries.every((q) => typeof q.question === 'string' && q.question.trim())).toBe(true);
+  });
+
+  it('keeps the expanded set a superset of the original, over the same documents', () => {
+    // The expanded set is the headline test set; the original 110 questions are
+    // kept as its prefix, verbatim, so both can be read from one run.
+    expect(expandedSet.documents).toEqual(testSet.documents);
+    expect(expandedSet.queries.slice(0, testSet.queries.length)).toEqual(testSet.queries);
+  });
+
+  it('labels every expanded question with a real document or null', () => {
+    const ids = new Set(expandedSet.documents.map((d) => d.id));
+    const unknown = expandedSet.queries.filter((q) => q.expected !== null && !ids.has(q.expected));
+    expect(unknown).toEqual([]);
+    // Added questions name the document they were written against.
+    const badNearMiss = expandedSet.queries.filter((q) => q.nearMissOf && !ids.has(q.nearMissOf));
+    expect(badNearMiss).toEqual([]);
+    expect(expandedSet.queries.every((q) => typeof q.question === 'string' && q.question.trim())).toBe(true);
+  });
+
+  it('has no duplicate or calibration-overlapping questions in the expanded set', () => {
+    const questions = expandedSet.queries.map(normalise);
+    expect(new Set(questions).size).toBe(questions.length);
+    const calibration = new Set(calibrationSet.queries.map(normalise));
+    expect(questions.filter((q) => calibration.has(q))).toEqual([]);
+  });
+
+  it('expands only the unanswerable side, so over-refusal keeps its denominator', () => {
+    // Ten documents hold roughly seventy extractable facts, so extra answerable
+    // questions would be paraphrases rather than independent trials.
+    const answerable = (set) => set.queries.filter((q) => q.expected).length;
+    expect(answerable(expandedSet)).toBe(answerable(testSet));
+    expect(expandedSet.queries.filter((q) => !q.expected).length).toBeGreaterThanOrEqual(150);
   });
 
   it('labels every calibration question against the shared documents', () => {
